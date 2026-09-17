@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.bak
+*.log
+.env
+.env.*
+auth.json
+.credentials.json
+codex-accounts.json
+claude-accounts.json

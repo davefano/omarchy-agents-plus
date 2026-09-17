@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Use a separate Codex login: codex-account NAME [login | Codex arguments...]."""
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ('--help', '-h'):
+        print(__doc__)
+        print('Example: codex-account work login')
+        print('Then:    codex-account work')
+        return 0
+    name = sys.argv[1]
+    if not re.fullmatch('[a-z0-9][a-z0-9_-]{0,47}', name):
+        sys.exit('Use a short lowercase account name containing letters, numbers, - or _.')
+    directory = Path.home() / ('.codex-' + name)
+    directory.mkdir(mode=0o700, exist_ok=True)
+    env = os.environ.copy()
+    env['CODEX_HOME'] = str(directory)
+    for key in ('OPENAI_API_KEY', 'OPENAI_ACCESS_TOKEN', 'CODEX_ACCESS_TOKEN'):
+        env.pop(key, None)
+    args = sys.argv[2:]
+    if args and args[0] == 'login':
+        result = subprocess.run(['codex', '-c', 'cli_auth_credentials_store="file"', *args], env=env)
+        if result.returncode == 0:
+            config = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+            helper = config / 'omarchy/plugins/davidfano.agents/codex_accounts.py'
+            if helper.is_file():
+                subprocess.run([sys.executable, str(helper), '--force', 'codex-' + name])
+        return result.returncode
+    os.execvpe('codex', ['codex', *args], env)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
