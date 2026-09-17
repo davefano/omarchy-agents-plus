@@ -216,6 +216,12 @@ Item {
     return settings.providers[id].enabled !== false
   }
 
+  function providerName(record) {
+    var id = String(record.id)
+    var configured = settings && settings.providers ? settings.providers[id] : null
+    return String(configured && configured.name ? configured.name : (record.name || id))
+  }
+
   // All-time keeps a quiet day from hiding an agent; today's counts admit a
   // machine whose only source is history.jsonl, which knows nothing older.
   function providerHasData(p) {
@@ -248,7 +254,7 @@ Item {
 
     return {
       providerId: String(record.id),
-      providerName: String(record.name || record.id),
+      providerName: providerName(record),
       ready: record.ready === true || synced,
       usageStatusText: String(record.usageStatusText || ""),
       authHelpText: String(record.authHelpText || ""),
@@ -666,7 +672,7 @@ Item {
   function providerSnapshot(record) {
     return {
       providerId: String(record.id),
-      providerName: String(record.name || record.id),
+      providerName: providerName(record),
       ready: record.ready === true,
       hasLocalStats: record.hasLocalStats !== false,
       hasPromptStats: record.hasPromptStats !== false,
