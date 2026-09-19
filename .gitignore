@@ -9,3 +9,4 @@ auth.json
 .credentials.json
 codex-accounts.json
 claude-accounts.json
+grok-accounts.json

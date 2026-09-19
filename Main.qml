@@ -225,7 +225,7 @@ Item {
   // All-time keeps a quiet day from hiding an agent; today's counts admit a
   // machine whose only source is history.jsonl, which knows nothing older.
   function providerHasData(p) {
-    return numberValue(p.totalPrompts) > 0 || numberValue(p.totalSessions) > 0
+    return p.accountAvailable === true || numberValue(p.totalPrompts) > 0 || numberValue(p.totalSessions) > 0
       || numberValue(p.activeDays) > 0 || numberValue(p.todayPrompts) > 0
       || numberValue(p.todaySessions) > 0 || (p.limits && p.limits.length > 0)
       || !!p.balance
@@ -255,6 +255,9 @@ Item {
     return {
       providerId: String(record.id),
       providerName: providerName(record),
+      configDir: String(record.configDir || ""),
+      accountAvailable: record.accountAvailable === true,
+      usageNote: String(record.usageNote || ""),
       ready: record.ready === true || synced,
       usageStatusText: String(record.usageStatusText || ""),
       authHelpText: String(record.authHelpText || ""),

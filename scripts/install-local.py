@@ -16,7 +16,7 @@ def main():
         (repo / 'bin/codex-account', home / '.local/bin/codex-account'),
     ]
     if not (repo / 'manifest.json').is_file() or not links[1][0].is_file():
-        raise SystemExit('Run this installer from a complete omarchy-agents checkout.')
+        raise SystemExit('Run this installer from a complete omarchy-agents-plus checkout.')
     backup = None
     for source, target in links:
         if target.resolve() == source:

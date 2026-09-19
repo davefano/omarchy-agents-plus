@@ -18,6 +18,25 @@ Panel {
   readonly property color track: Style.selectedFillFor(foreground, Color.accent)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
+  // Omarchy can reinject a ModuleSlot's original settings after plugin reloads.
+  // Read the current shell entry for display and edits so that stale snapshot
+  // cannot hide saved names or overwrite them on the next save.
+  readonly property var persistedSettings: {
+    var host = root.bar && root.bar.shell ? root.bar.shell : null
+    var config = host && "shellConfig" in host ? host.shellConfig : null
+    if (!config) return root.settings
+    var layout = config.bar && config.bar.layout ? config.bar.layout : {}
+    var groups = [layout.left || [], layout.center || [], layout.right || [], config.plugins || []]
+    var target = Util.canonicalWidgetId(root.moduleName)
+    for (var g = 0; g < groups.length; g++) {
+      for (var i = 0; i < groups[g].length; i++) {
+        var entry = groups[g][i]
+        if (entry && Util.canonicalWidgetId(String(entry.id || "")) === target) return entry
+      }
+    }
+    return root.settings
+  }
+
   readonly property var allAccounts: usage.enabledProviders
   readonly property var companies: {
     var result = []
@@ -28,7 +47,7 @@ Panel {
       seen[company.value] = true
       result.push(company)
     }
-    var order = ["anthropic", "openai", "fireworks"]
+    var order = ["anthropic", "openai", "xai", "fireworks"]
     return result.sort(function(a, b) {
       var ai = order.indexOf(a.value), bi = order.indexOf(b.value)
       return (ai < 0 ? order.length : ai) - (bi < 0 ? order.length : bi)
@@ -43,9 +62,9 @@ Panel {
   }
   readonly property string companyId: companies.length > 0 ? companies[companyIndex].value : ""
   readonly property string companyName: companies.length > 0 ? companies[companyIndex].label : ""
-  readonly property var providers: allAccounts.filter(function(account) {
+  readonly property var providers: sortAccounts(allAccounts.filter(function(account) {
     return companyForAccount(account).value === companyId
-  })
+  }), overviewSort(companyId))
   // Keep each company's selected account stable across refreshes and tab changes.
   property var selectedAccountIds: ({})
   readonly property string selectedProviderId: selectedAccountIds[companyId] || ""
@@ -58,7 +77,88 @@ Panel {
 
   property bool cursorActive: false
   property bool overview: true
-  onOverviewChanged: if (panelFlick) panelFlick.contentY = 0
+  onOverviewChanged: {
+    if (panelFlick) panelFlick.contentY = 0
+    Qt.callLater(refreshIdentity)
+  }
+
+  property var accountIdentity: null
+  property bool identityRefreshPending: false
+  readonly property string identityKey: provider ? provider.providerId + "\n" + provider.configDir : ""
+  readonly property string identityText: {
+    if (!accountIdentity || accountIdentity.key !== identityKey) return "Checking account email…"
+    return accountIdentity.email || accountIdentity.status || "Email unavailable"
+  }
+  // Usage rebuilds provider objects even when the selected login is unchanged.
+  // Only selection changes should trigger another immediate identity lookup.
+  onIdentityKeyChanged: {
+    reauthError = ""
+    Qt.callLater(refreshIdentity)
+  }
+
+  property string reauthError: ""
+  readonly property bool canReauthenticate: !!provider
+    && (companyId === "anthropic" || companyId === "openai" || companyId === "xai")
+    && (provider.providerId === "claude" || provider.providerId === "codex"
+      || provider.providerId === "grok" || provider.configDir !== "")
+
+  function reauthenticate() {
+    if (!canReauthenticate || reauthLauncher.running) return
+    reauthError = ""
+    reauthLauncher.requestKey = identityKey
+    reauthLauncher.command = ["python3",
+      decodeURIComponent(String(Qt.resolvedUrl("add_account.py")).replace(/^file:\/\//, "")),
+      "launch-reauth", "--", companyId, provider.providerName, provider.providerId, provider.configDir]
+    reauthLauncher.running = true
+  }
+
+  function refreshIdentity() {
+    if (!opened || overview || !provider) return
+    if (identityProcess.running) {
+      identityRefreshPending = true
+      return
+    }
+    // Keep the current email visible until its replacement arrives. identityKey
+    // already prevents showing it for a different account.
+    identityProcess.requestKey = identityKey
+    identityProcess.command = ["python3",
+      decodeURIComponent(String(Qt.resolvedUrl("account_identity.py")).replace(/^file:\/\//, "")),
+      "--", provider.providerId, provider.configDir]
+    identityProcess.running = true
+  }
+
+  function renameAccount(accountId, name) {
+    name = name.trim()
+    if (!name || name.length > 80 || /[\x00-\x1f\x7f]/.test(name))
+      return "Enter a name of 1–80 characters on one line."
+    if (!root.bar || !root.bar.shell || typeof root.bar.shell.updateEntryInline !== "function")
+      return "Account settings are unavailable. Please reopen the panel."
+    var next = Object.assign({}, root.persistedSettings)
+    next.providers = Object.assign({}, next.providers || {})
+    var previous = next.providers[accountId] || {}
+    if (previous.name === name) return ""
+    next.providers[accountId] = Object.assign({}, previous, { name: name })
+    if (!root.bar.shell.updateEntryInline(root.moduleName, next))
+      return "Unable to save the account name. Please reopen the panel."
+    root.settings = next
+    return ""
+  }
+
+  component AccountLink: AbstractButton {
+    id: link
+    implicitWidth: contentItem.implicitWidth
+    implicitHeight: contentItem.implicitHeight
+    padding: 0
+    opacity: enabled ? 1 : 0.5
+    contentItem: Text {
+      text: link.text
+      color: link.hovered || link.activeFocus ? Color.accent : root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      font.underline: true
+    }
+    HoverHandler { cursorShape: Qt.PointingHandCursor }
+  }
 
   // Refresh calendar labels while the panel is open, including across midnight.
   property double nowMs: Date.now()
@@ -91,9 +191,11 @@ Panel {
   function alpha(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
 
   function companyForAccount(account) {
+    if (!account) return { value: "", label: "" }
     var id = String(account.providerId || "")
     if (/^claude(?:-|$)/.test(id)) return { value: "anthropic", label: "Anthropic" }
     if (/^codex(?:-|$)/.test(id)) return { value: "openai", label: "OpenAI" }
+    if (/^grok(?:-|$)/.test(id)) return { value: "xai", label: "xAI" }
     if (/^fireworks(?:-|$)/.test(id)) return { value: "fireworks", label: "Fireworks" }
     return { value: id, label: String(account.providerName || id) }
   }
@@ -130,19 +232,117 @@ Panel {
     keyCatcher.forceActiveFocus()
   }
 
-  function weeklyLabel(p) {
-    return p && /^claude(?:-|$)/.test(String(p.providerId || "")) ? "Fable weekly" : "Weekly"
+  function metricKey(label) {
+    var key = String(label || "").trim().toLowerCase()
+    if (/^(weekly(?: \(7-day\))?|7[- ]day(?: window)?|7d(?: window)?|week)$/.test(key)) return "weekly"
+    return key
   }
 
-  // Claude accounts track Fable; other providers use the account-wide week.
-  function weeklyWindow(p) {
+  function overviewMetric(company) {
+    var choices = root.persistedSettings.overviewMetrics || {}
+    return String(choices[company] || "weekly")
+  }
+
+  readonly property var sortOptions: [
+    { value: "default", label: "Default account order" },
+    { value: "usage-asc", label: "Usage: least used first" },
+    { value: "usage-desc", label: "Usage: most used first" },
+    { value: "reset-asc", label: "Reset: soonest first" },
+    { value: "reset-desc", label: "Reset: latest first" }
+  ]
+
+  function overviewSort(company) {
+    var sorts = root.persistedSettings.overviewSorts || {}
+    return String(sorts[company] || "default")
+  }
+
+  function sortAccounts(accounts, mode) {
+    if (mode === "default") return accounts
+    var byReset = mode === "reset-asc" || mode === "reset-desc"
+    var descending = mode === "usage-desc" || mode === "reset-desc"
+    // Read each selected window once. Original positions break ties so equal
+    // percentages don't shuffle accounts on every refresh; unknowns stay last.
+    return accounts.map(function(account, index) {
+      var window = overviewWindow(account)
+      var value = window ? (byReset ? Date.parse(window.resetAt) : window.percent) : NaN
+      return { account: account, index: index, value: value }
+    }).sort(function(a, b) {
+      var aKnown = isFinite(a.value), bKnown = isFinite(b.value)
+      if (aKnown !== bKnown) return aKnown ? -1 : 1
+      if (!aKnown || a.value === b.value) return a.index - b.index
+      return (a.value - b.value) * (descending ? -1 : 1)
+    }).map(function(row) { return row.account })
+  }
+
+  function metricLabel(key) {
+    if (key === "weekly") return "Overall weekly usage"
+    if (key === "fable weekly") return "Fable weekly usage"
+    if (key === "session (5-hour)") return "Session usage (5-hour)"
+    return key.charAt(0).toUpperCase() + key.slice(1)
+  }
+
+  function metricOptions(company) {
+    var seen = {}
+    var result = []
+    allAccounts.forEach(function(account) {
+      if (companyForAccount(account).value !== company) return
+      var limits = account.limits || []
+      limits.forEach(function(entry) {
+        var key = metricKey(entry.label)
+        if (!key || seen[key]) return
+        seen[key] = true
+        result.push({value: key, label: metricLabel(key)})
+      })
+    })
+    // Keep a saved selection reachable if an account stops reporting that limit.
+    var selected = overviewMetric(company)
+    if (!seen[selected]) result.push({value: selected, label: metricLabel(selected)})
+    var order = ["weekly", "fable weekly", "session (5-hour)"]
+    return result.sort(function(a, b) {
+      var ai = order.indexOf(a.value), bi = order.indexOf(b.value)
+      return (ai < 0 ? order.length : ai) - (bi < 0 ? order.length : bi) || a.label.localeCompare(b.label)
+    })
+  }
+
+  readonly property var overviewOptions: metricOptions(companyId)
+  readonly property string overviewHeading: metricLabel(overviewMetric(companyId)).replace(/ usage(?: \(5-hour\))?$/, "") + " limits"
+
+  function saveOverviewSettings(company, metric, sort) {
+    sort = sort || overviewSort(company)
+    if (!metricOptions(company).some(function(option) { return option.value === metric }))
+      return "Choose an available usage limit."
+    if (!sortOptions.some(function(option) { return option.value === sort }))
+      return "Choose an available sort order."
+    if (!root.bar || !root.bar.shell || typeof root.bar.shell.updateEntryInline !== "function")
+      return "Settings are unavailable. Please reopen the panel."
+    var next = Object.assign({}, root.persistedSettings)
+    next.overviewMetrics = Object.assign({}, next.overviewMetrics || {})
+    next.overviewMetrics[company] = metric
+    next.overviewSorts = Object.assign({}, next.overviewSorts || {})
+    next.overviewSorts[company] = sort
+    var selected = provider ? provider.providerId : ""
+    if (!root.bar.shell.updateEntryInline(root.moduleName, next))
+      return "Unable to save settings. Please try again."
+    root.settings = next
+    // A new order must not silently switch the selected account.
+    if (selected) {
+      var selections = Object.assign({}, selectedAccountIds)
+      selections[companyId] = selected
+      selectedAccountIds = selections
+    }
+    return ""
+  }
+
+  function openOverviewSettings() {
+    overviewSettingsDialog.open(companyId, companyName, overviewOptions, overviewMetric(companyId), overviewSort(companyId))
+  }
+
+  function overviewWindow(p) {
+    var selected = overviewMetric(companyForAccount(p).value)
     var entries = p ? (p.limits || []) : []
     for (var i = 0; i < entries.length; i++) {
       var entry = entries[i] || {}
-      var label = String(entry.label || "").trim().toLowerCase()
-      if (weeklyLabel(p) === "Fable weekly") {
-        if (label !== "fable weekly") continue
-      } else if (!/^(weekly(?: \(7-day\))?|7[- ]day(?: window)?|7d(?: window)?|week)$/.test(label)) continue
+      if (metricKey(entry.label) !== selected) continue
       if (entry.percent === null || entry.percent === undefined || entry.percent === "") continue
       var percent = Number(entry.percent)
       if (!isFinite(percent) || percent < 0) continue
@@ -151,9 +351,9 @@ Panel {
     return null
   }
 
-  function weeklyResetText(window) {
-    if (!window) return "Weekly limit unavailable"
-    return resetLabel(window)
+  function overviewResetText(p, window) {
+    var label = metricLabel(overviewMetric(companyForAccount(p).value))
+    return window ? label.replace(/ usage$/, "") + " · " + resetLabel(window) : label + " unavailable"
   }
 
   function moveOverviewCursor(delta) {
@@ -169,6 +369,7 @@ Panel {
 
   function refreshNow() {
     usage.refreshAll(true)
+    refreshIdentity()
   }
 
   function launchAgent() {
@@ -398,6 +599,7 @@ Panel {
   // if it doesn't.
   function iconCandidatesForProvider(p, surfaceColor) {
     if (!p) return []
+    if (/^grok(?:-|$)/.test(p.providerId)) return []
     var candidates = []
     if (colorLuminance(surfaceColor || Color.background) >= 0.5)
       candidates.push(Qt.resolvedUrl("assets/" + p.providerId + "-light.svg"))
@@ -405,10 +607,7 @@ Panel {
     return candidates
   }
 
-  // Nothing to report, nothing in the bar: Bar.qml collapses a slot whose item
-  // is invisible, so the icon appears the moment the first scan finds usage and
-  // stays away entirely on a machine that has never run either CLI.
-  visible: allAccounts.length > 0
+  // Keep account setup reachable even before the first login has usage.
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -423,11 +622,48 @@ Panel {
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   } else {
     accountSelector.close()
+    addAccountDialog.close()
+    editAccountDialog.close()
+    overviewSettingsDialog.close()
   }
 
   Main {
     id: usage
-    settings: root.settings
+    settings: root.persistedSettings
+  }
+
+  Process {
+    id: reauthLauncher
+    property string requestKey: ""
+    stderr: StdioCollector {
+      onStreamFinished: if (reauthLauncher.requestKey === root.identityKey && text.trim())
+        root.reauthError = text.trim()
+    }
+    onExited: function(code) {
+      if (code === 0) root.close()
+      else if (requestKey === root.identityKey && !root.reauthError)
+        root.reauthError = "Unable to open the terminal. Please try again."
+    }
+  }
+
+  Process {
+    id: identityProcess
+    property string requestKey: ""
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var result
+        try { result = JSON.parse(text) }
+        catch (e) { result = { email: "", status: "Email unavailable" } }
+        root.accountIdentity = { key: identityProcess.requestKey,
+          email: String(result.email || ""), status: String(result.status || "") }
+      }
+    }
+    onExited: {
+      if (root.identityRefreshPending) {
+        root.identityRefreshPending = false
+        Qt.callLater(root.refreshIdentity)
+      }
+    }
   }
 
   Process {
@@ -454,6 +690,7 @@ Panel {
     onTriggered: {
       root.nowMs = Date.now()
       root.refreshResetLabels()
+      root.refreshIdentity()
     }
   }
 
@@ -491,12 +728,53 @@ Panel {
     contentWidth: panel.fittedContentWidth(Style.space(380))
     // Taller than the control panels on purpose: this one is a dashboard, and
     // the whole point is reading limits and history without scrolling.
-    contentHeight: panel.fittedContentHeight(column.implicitHeight + providerTabs.height + Style.space(12), Style.space(640))
+    contentHeight: panel.fittedContentHeight(Math.max(column.implicitHeight + providerTabs.height + Style.space(12),
+      addAccountDialog.opened ? addAccountDialog.minimumHeight : 0,
+      editAccountDialog.opened ? editAccountDialog.minimumHeight : 0,
+      overviewSettingsDialog.opened ? overviewSettingsDialog.minimumHeight : 0), Style.space(640))
+
+    AddAccountDialog {
+      id: addAccountDialog
+      anchors.fill: parent
+      z: 10
+      foreground: root.foreground
+      fontFamily: root.fontFamily
+      onCanceled: { close(); keyCatcher.forceActiveFocus() }
+      onLaunched: { close(); root.close() }
+    }
+
+    EditAccountDialog {
+      id: editAccountDialog
+      anchors.fill: parent
+      z: 10
+      foreground: root.foreground
+      fontFamily: root.fontFamily
+      onCanceled: { close(); keyCatcher.forceActiveFocus() }
+      onSaveRequested: function(accountId, name) {
+        errorText = root.renameAccount(accountId, name)
+        if (!errorText) { close(); keyCatcher.forceActiveFocus() }
+      }
+    }
+
+    OverviewSettingsDialog {
+      id: overviewSettingsDialog
+      anchors.fill: parent
+      z: 10
+      foreground: root.foreground
+      fontFamily: root.fontFamily
+      sortOptions: root.sortOptions
+      onCanceled: { close(); keyCatcher.forceActiveFocus() }
+      onSaveRequested: function(companyId, metric, sort) {
+        errorText = root.saveOverviewSettings(companyId, metric, sort)
+        if (!errorText) { close(); keyCatcher.forceActiveFocus() }
+      }
+    }
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: accountSelector.popupOpen
+      blocked: accountSelector.popupOpen || addAccountDialog.opened || editAccountDialog.opened || overviewSettingsDialog.opened
+      enabled: !addAccountDialog.opened && !editAccountDialog.opened && !overviewSettingsDialog.opened
 
       onMoveRequested: function(dx, dy) {
         if (dx !== 0) {
@@ -521,7 +799,11 @@ Panel {
         else root.showOverview()
       }
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(t) { if (t === "r" || t === "R") root.refreshNow() }
+      onTextKey: function(t) {
+        if (t === "r" || t === "R") root.refreshNow()
+        else if ((t === "s" || t === "S") && root.overview && root.providers.length > 0) root.openOverviewSettings()
+        else if (t === "+") addAccountDialog.open(root.companyId)
+      }
 
       Row {
         id: providerTabs
@@ -529,12 +811,18 @@ Panel {
         width: parent.width
         spacing: Style.space(8)
 
+        Item {
+          visible: root.companies.length === 0
+          width: providerTabs.width - addAccountButton.width - providerTabs.spacing
+          height: 1
+        }
+
         Repeater {
           model: root.companies
           Button {
             required property var modelData
             required property int index
-            width: (providerTabs.width - providerTabs.spacing * (root.companies.length - 1)) / Math.max(1, root.companies.length)
+            width: (providerTabs.width - addAccountButton.width - providerTabs.spacing * root.companies.length) / Math.max(1, root.companies.length)
             text: modelData.label
             selected: modelData.value === root.companyId
             bordered: true
@@ -542,6 +830,20 @@ Panel {
             fontFamily: root.fontFamily
             fontSize: Style.font.bodySmall
             onClicked: root.selectCompany(index)
+          }
+        }
+        Button {
+          id: addAccountButton
+          width: implicitHeight
+          text: "+"
+          tooltipText: "Add account"
+          bordered: true
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.bodySmall
+          onClicked: {
+            accountSelector.close()
+            addAccountDialog.open(root.companyId)
           }
         }
       }
@@ -572,25 +874,37 @@ Panel {
             spacing: Style.space(12)
 
             Text {
-              text: "Weekly limits"
+              text: root.overviewHeading
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.title
               font.bold: true
             }
-            Text {
+            Row {
               width: parent.width
-              text: root.providers.length + " accounts · weekly allowance used"
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
+              spacing: Style.space(6)
+              Text {
+                text: root.providers.length > 0
+                  ? root.providers.length + (root.providers.length === 1 ? " account" : " accounts")
+                    + (overviewSettingsLink.visible ? " ·" : "")
+                  : "Add an account with + to get started."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+              AccountLink {
+                id: overviewSettingsLink
+                objectName: "overviewSettingsLink"
+                text: "settings"
+                visible: root.providers.length > 0
+                onClicked: root.openOverviewSettings()
+              }
             }
 
             Repeater {
               id: overviewRows
               model: root.providers
-              WeeklyAccountRow {
+              OverviewAccountRow {
                 required property var modelData
                 required property int index
                 width: parent.width
@@ -621,56 +935,144 @@ Panel {
               fontFamily: root.fontFamily
               onClicked: root.showOverview()
             }
-            // ---------- Hero: provider mark · name · plan ----------
-            PanelHero {
+            // ---------- Hero: provider mark · name · plan and email ----------
+            Item {
               id: hero
               visible: !!root.provider
               width: parent.width
-              title: root.provider ? root.provider.providerName : ""
-              meta: root.heroMeta(root.provider)
-              foreground: root.foreground
-              fontFamily: root.fontFamily
+              implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight)
 
-              iconComponent: Component {
-                Item {
-                  id: heroMark
-                  property var candidates: root.iconCandidatesForProvider(root.provider, root.surface)
-                  // Provider objects are rebuilt on every refresh, which churns the
-                  // array's identity without changing its content. Restart the fallback
-                  // walk only when the URLs change: re-pointing source at a URL whose
-                  // load already failed emits no statusChanged, so an identity-only
-                  // reset would strand the walker on a missing -light twin.
-                  property string candidatesKey: candidates.join("\n")
-                  property int candidateIndex: 0
-                  onCandidatesKeyChanged: candidateIndex = 0
+              Loader {
+                id: heroIcon
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                sourceComponent: Component {
+                  Item {
+                    id: heroMark
+                    property var candidates: root.iconCandidatesForProvider(root.provider, root.surface)
+                    // Provider objects are rebuilt on every refresh, which churns the
+                    // array's identity without changing its content. Restart the fallback
+                    // walk only when the URLs change: re-pointing source at a URL whose
+                    // load already failed emits no statusChanged, so an identity-only
+                    // reset would strand the walker on a missing -light twin.
+                    property string candidatesKey: candidates.join("\n")
+                    property int candidateIndex: 0
+                    onCandidatesKeyChanged: candidateIndex = 0
 
-                  width: Style.font.display
-                  height: Style.font.display
+                    width: Style.font.display
+                    height: Style.font.display
 
-                  Image {
-                    id: heroMarkImage
-                    anchors.fill: parent
-                    source: heroMark.candidateIndex < heroMark.candidates.length ? heroMark.candidates[heroMark.candidateIndex] : ""
-                    sourceSize.width: Style.font.display * 2
-                    sourceSize.height: Style.font.display * 2
-                    fillMode: Image.PreserveAspectFit
-                    // Advancing source from inside its own status change trips the
-                    // binding-loop detector; defer the step one tick.
-                    onStatusChanged: if (status === Image.Error && heroMark.candidateIndex < heroMark.candidates.length)
-                      Qt.callLater(function() { heroMark.candidateIndex++ })
-                  }
+                    Image {
+                      id: heroMarkImage
+                      anchors.fill: parent
+                      source: heroMark.candidateIndex < heroMark.candidates.length ? heroMark.candidates[heroMark.candidateIndex] : ""
+                      sourceSize.width: Style.font.display * 2
+                      sourceSize.height: Style.font.display * 2
+                      fillMode: Image.PreserveAspectFit
+                      // Advancing source from inside its own status change trips the
+                      // binding-loop detector; defer the step one tick.
+                      onStatusChanged: if (status === Image.Error && heroMark.candidateIndex < heroMark.candidates.length)
+                        Qt.callLater(function() { heroMark.candidateIndex++ })
+                    }
 
-                  Text {
-                    textFormat: Text.PlainText
-                    anchors.centerIn: parent
-                    visible: heroMarkImage.status !== Image.Ready
-                    text: button.text
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.display
+                    Text {
+                      textFormat: Text.PlainText
+                      anchors.centerIn: parent
+                      visible: heroMarkImage.status !== Image.Ready
+                      text: button.text
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.display
+                    }
                   }
                 }
               }
+
+              Column {
+                id: heroLabels
+                anchors.left: heroIcon.right
+                anchors.leftMargin: Style.space(14)
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+
+                Text {
+                  width: parent.width
+                  text: root.provider ? root.provider.providerName : ""
+                  textFormat: Text.PlainText
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.title
+                  font.bold: true
+                  elide: Text.ElideRight
+                }
+
+                Row {
+                  width: parent.width
+                  spacing: Style.space(10)
+
+                  Text {
+                    id: planLabel
+                    width: Math.min(implicitWidth, parent.width * 0.45)
+                    text: root.heroMeta(root.provider).toUpperCase()
+                    textFormat: Text.PlainText
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                    font.letterSpacing: 1.2
+                    elide: Text.ElideRight
+                  }
+
+                  Text {
+                    objectName: "accountEmail"
+                    width: Math.min(implicitWidth, Math.max(0, parent.width - planLabel.width - parent.spacing
+                      - (reauthLink.visible ? reauthLink.width + parent.spacing : 0)
+                      - editLink.width - parent.spacing))
+                    text: root.identityText
+                    textFormat: Text.PlainText
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                    ToolTip.visible: emailHover.hovered && truncated
+                    ToolTip.text: text
+                    HoverHandler { id: emailHover }
+                  }
+
+                  AccountLink {
+                    id: reauthLink
+                    objectName: "reauthenticateAccount"
+                    visible: root.canReauthenticate
+                    enabled: !reauthLauncher.running
+                    text: "re-auth"
+                    Accessible.name: "Re-authenticate account"
+                    onClicked: root.reauthenticate()
+                  }
+
+                  AccountLink {
+                    id: editLink
+                    objectName: "editAccount"
+                    text: "edit"
+                    Accessible.name: "Edit account name"
+                    onClicked: {
+                      accountSelector.close()
+                      editAccountDialog.open(root.provider)
+                    }
+                  }
+                }
+              }
+            }
+
+            Text {
+              visible: text !== ""
+              width: parent.width
+              text: root.reauthError
+              textFormat: Text.PlainText
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
             }
 
             Text {
@@ -717,6 +1119,17 @@ Panel {
               onPopupOpenChanged: if (!popupOpen && root.opened)
                 keyCatcher.forceActiveFocus()
               onHovered: function(isHovered) { if (isHovered) root.cursorActive = true }
+            }
+
+            Text {
+              width: parent.width
+              visible: text !== ""
+              text: root.provider ? root.provider.usageNote : ""
+              textFormat: Text.PlainText
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
             }
 
             // ---------- Status ----------
@@ -926,13 +1339,13 @@ Panel {
     }
   }
 
-  component WeeklyAccountRow: BorderSurface {
+  component OverviewAccountRow: BorderSurface {
     id: accountRow
     property var account: null
     property bool hasCursor: false
     signal chosen()
-    readonly property var weekly: root.weeklyWindow(account)
-    readonly property bool warning: weekly && weekly.percent >= 0.9
+    readonly property var window: root.overviewWindow(account)
+    readonly property bool warning: window && window.percent >= 0.9
     readonly property bool hot: rowMouse.containsMouse || hasCursor
     implicitHeight: rowContent.implicitHeight + Style.space(20)
     radius: Style.cornerRadius
@@ -948,12 +1361,12 @@ Panel {
 
       Item {
         width: parent.width
-        implicitHeight: Math.max(accountName.implicitHeight, weeklyValue.implicitHeight)
+        implicitHeight: Math.max(accountName.implicitHeight, overviewValue.implicitHeight)
         Text {
           id: accountName
           textFormat: Text.PlainText
           anchors.left: parent.left
-          anchors.right: weeklyValue.left
+          anchors.right: overviewValue.left
           anchors.rightMargin: Style.space(12)
           text: accountRow.account ? accountRow.account.providerName : ""
           color: root.foreground
@@ -962,9 +1375,9 @@ Panel {
           elide: Text.ElideRight
         }
         Text {
-          id: weeklyValue
+          id: overviewValue
           anchors.right: parent.right
-          text: accountRow.weekly ? Math.round(accountRow.weekly.percent * 100) + "% used  ›" : "—  ›"
+          text: accountRow.window ? Math.round(accountRow.window.percent * 100) + "% used  ›" : "—  ›"
           color: accountRow.warning ? root.urgent : root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -974,13 +1387,13 @@ Panel {
 
       Meter {
         width: parent.width
-        visible: !!accountRow.weekly
-        value: accountRow.weekly ? accountRow.weekly.percent : 0
+        visible: !!accountRow.window
+        value: accountRow.window ? accountRow.window.percent : 0
         alarming: accountRow.warning
       }
       Text {
         width: parent.width
-        text: root.weeklyLabel(accountRow.account) + " · " + (accountRow.weekly ? root.weeklyResetText(accountRow.weekly) : "Unavailable")
+        text: root.overviewResetText(accountRow.account, accountRow.window)
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption

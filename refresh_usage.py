@@ -114,6 +114,10 @@ def main():
     if codex_helper.is_file():
         extra_status = subprocess.run([sys.executable, str(codex_helper), *args]).returncode
         status = status or extra_status
+    grok_helper = Path(__file__).with_name('grok_accounts.py')
+    if grok_helper.is_file():
+        extra_status = subprocess.run([sys.executable, str(grok_helper), *args]).returncode
+        status = status or extra_status
     return status
 
 

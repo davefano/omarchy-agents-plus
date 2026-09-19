@@ -29,6 +29,10 @@ def main():
             config = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
             helper = config / 'omarchy/plugins/davidfano.agents/codex_accounts.py'
             if helper.is_file():
+                registration = subprocess.run([sys.executable, str(helper.with_name('add_account.py')),
+                                               'register', '--', 'openai', name])
+                if registration.returncode != 0:
+                    return registration.returncode
                 subprocess.run([sys.executable, str(helper), '--force', 'codex-' + name])
         return result.returncode
     os.execvpe('codex', ['codex', *args], env)
